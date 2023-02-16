@@ -1,15 +1,22 @@
 package tests_test
 
 import (
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 	. "gorm.io/gorm/utils/tests"
 )
 
@@ -268,4 +275,110 @@ func TestPreloadWithDiffModel(t *testing.T) {
 		"users.*, 'yo' as something").First(&result, "name = ?", user.Name)
 
 	CheckUser(t, user, result.User)
+}
+
+func TestNestedPreloadFirstLevelError(t *testing.T) {
+	dialect := os.Getenv("GORM_DIALECT")
+	if dialect != "postgres" {
+		t.SkipNow()
+	}
+
+	nativeDB, err := sql.Open("postgres", os.Getenv("GORM_DSN"))
+	if err != nil {
+		t.Error(err)
+	}
+
+	conn := &wrapperConnPool{
+		db: nativeDB,
+		returnErrorOn: map[string]error{
+			"SELECT * FROM \"level2\" WHERE \"level2\".\"level3_id\" = $1": errors.New("faked database error"),
+		},
+	}
+
+	defer conn.db.Close()
+
+	localDB, err := gorm.Open(postgres.New(postgres.Config{Conn: conn}), &gorm.Config{})
+	if err != nil {
+		t.Error(err)
+	}
+
+	if debug := os.Getenv("DEBUG"); debug == "true" {
+		localDB.Logger = localDB.Logger.LogMode(logger.Info)
+	} else if debug == "false" {
+		localDB.Logger = localDB.Logger.LogMode(logger.Silent)
+	}
+
+	type (
+		Level1 struct {
+			ID       uint
+			Value    string
+			Level2ID uint
+		}
+		Level2 struct {
+			ID       uint
+			Level1   Level1
+			Level3ID uint
+		}
+		Level3 struct {
+			ID     uint
+			Name   string
+			Level2 Level2
+		}
+	)
+
+	localDB.Migrator().DropTable(&Level1{}, &Level2{}, &Level3{})
+
+	if err := localDB.AutoMigrate(&Level1{}, &Level2{}, &Level3{}); err != nil {
+		t.Error(err)
+	}
+
+	savedToDb := Level3{Level2: Level2{Level1: Level1{Value: "value"}}}
+	if err := localDB.Create(&savedToDb).Error; err != nil {
+		t.Error(err)
+	}
+
+	want := savedToDb
+	want.Level2 = Level2{}
+
+	var got Level3
+	if err = localDB.Preload("Level2").Find(&got).Error; errors.Is(err, nil) {
+		t.Error("expecting error on preload failue")
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "faked database error") {
+		t.Error(err)
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %s; want %s", toJSONString(got), toJSONString(want))
+	}
+
+	// should not preload Level1 due to faked database error
+
+	conn = &wrapperConnPool{
+		db: nativeDB,
+		returnErrorOn: map[string]error{
+			"SELECT * FROM \"level2\" WHERE \"level2\".\"level3_id\" = $1": errors.New("faked database error"),
+		},
+	}
+
+	localDB, err = gorm.Open(postgres.New(postgres.Config{Conn: conn}), &gorm.Config{})
+	if err != nil {
+		t.Error(err)
+	}
+
+	want = savedToDb
+	want.Level2.Level1 = Level1{}
+
+	if err = localDB.Preload("Level2.Level1").Find(&got).Error; errors.Is(err, nil) {
+		t.Error("expecting error on nested preload failue")
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "faked database error") {
+		t.Error(err)
+	}
+
+	if !reflect.DeepEqual(got.Level2.Level1, want.Level2.Level1) {
+		t.Errorf("got %s; want %s", toJSONString(got), toJSONString(want))
+	}
 }
